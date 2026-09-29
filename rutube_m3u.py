@@ -1,279 +1,121 @@
-import requests
-import re
-import html
-import time
 
-BASE = "https://rutube.ru"
-WIDGET_URL = f"{BASE}/api/feeds/autowidget/2"
-OUTPUT = "rutube.m3u"
+import time
+import requests
+
+WIDGET_URL = "https://rutube.ru/api/feeds/autowidget/2"
+OUTPUT_FILE = "rutube.m3u"
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/153.0.0.0 Safari/537.36"
+        "Chrome/140.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json,text/plain,*/*",
+    "Accept": "application/json, text/plain, */*",
     "Referer": "https://rutube.ru/",
-}
-
-PAGE_HEADERS = {
-    **HEADERS,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
 
-def get_json(url, headers=None):
-    try:
-        r = session.get(
-            url,
-            headers=headers,
-            timeout=30
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"  JSON ERROR: {e}")
-        return None
-
-
 def clean_title(title):
-    title = title or "Без названия"
+    title = title.strip()
 
-    title = re.sub(
-        r"^Прямой эфир\s*:?\s*",
-        "",
-        title,
-        flags=re.IGNORECASE
-    )
+    for prefix in (
+        "Прямой эфир: ",
+        "Прямой эфир ",
+    ):
+        if title.startswith(prefix):
+            title = title[len(prefix):]
 
     return title.strip()
 
 
-def normalize_url(url):
-    if not url:
+def get_widget():
+    print("Получаю Rutube autowidget...")
+
+    r = session.get(WIDGET_URL, timeout=20)
+    r.raise_for_status()
+
+    return r.json()
+
+
+def get_hls(video_id):
+    url = (
+        f"https://rutube.ru/api/play/options/{video_id}/"
+        f"?format=json&no_404=true&referer=https%3A%2F%2Frutube.ru%2F"
+    )
+
+    try:
+        r = session.get(url, timeout=10)
+
+        if r.status_code != 200:
+            print(f"  API: HTTP {r.status_code}")
+            return None
+
+        data = r.json()
+
+    except requests.RequestException as e:
+        print(f"  API ERROR: {e}")
         return None
 
-    url = html.unescape(url)
-
-    url = url.replace("\\/", "/")
-    url = url.replace("\\u0026", "&")
-    url = url.replace("\\u003F", "?")
-    url = url.replace("\\u003f", "?")
-    url = url.replace("\\u003D", "=")
-    url = url.replace("\\u003d", "=")
-
-    return url.strip()
-
-
-def extract_m3u8_urls(text):
-    if not text:
-        return []
-
-    text = html.unescape(text)
-    text = text.replace("\\/", "/")
-    text = text.replace("\\u0026", "&")
-    text = text.replace("\\u003F", "?")
-    text = text.replace("\\u003f", "?")
-    text = text.replace("\\u003D", "=")
-    text = text.replace("\\u003d", "=")
-
-    pattern = re.compile(
-        r'https?://[^\'"\s<>\\]+?\.m3u8'
-        r'(?:\?[^\'"\s<>\\]*)?',
-        re.IGNORECASE
-    )
-
-    result = []
-
-    for url in pattern.findall(text):
-        url = normalize_url(url)
-
-        if url and url not in result:
-            result.append(url)
-
-    return result
-
-
-def get_api_hls(video_id):
-    url = (
-        f"{BASE}/api/play/options/"
-        f"{video_id}/?format=json"
-    )
-
-    data = get_json(url)
-
-    if not data:
+    except ValueError:
+        print("  API ERROR: неверный JSON")
         return None
 
     live_streams = data.get("live_streams") or {}
-
-    if not isinstance(live_streams, dict):
-        return None
-
-    hls = live_streams.get("hls")
+    hls = live_streams.get("hls") or []
 
     if not hls:
         return None
 
-    if isinstance(hls, list):
-        for item in hls:
-            if not isinstance(item, dict):
-                continue
+    # Берём именно master HLS.
+    for item in hls:
+        stream_url = item.get("url")
 
-            url = item.get("url")
-
-            if url:
-                return normalize_url(url)
-
-    elif isinstance(hls, dict):
-        url = hls.get("url")
-
-        if url:
-            return normalize_url(url)
+        if stream_url:
+            return stream_url
 
     return None
 
 
-def get_page_hls(video_id):
-    """
-    Резервный вариант.
-    Пытается найти m3u8 непосредственно в HTML страницы.
-
-    Это работает только для случаев, когда URL потока
-    действительно присутствует в HTML/встроенном JSON.
-    """
-
-    page_url = f"{BASE}/live/video/{video_id}/"
-
-    try:
-        r = session.get(
-            page_url,
-            headers=PAGE_HEADERS,
-            timeout=30
-        )
-
-        if r.status_code != 200:
-            print(f"  PAGE HTTP: {r.status_code}")
-            return None
-
-        urls = extract_m3u8_urls(r.text)
-
-        if not urls:
-            print("  PAGE: m3u8 не найден")
-            return None
-
-        # Если есть master/index — предпочитаем его
-        for url in urls:
-            if "index.m3u8" in url.lower():
-                print(f"  PAGE HLS: {url}")
-                return url
-
-        for url in urls:
-            if "master.m3u8" in url.lower():
-                print(f"  PAGE HLS: {url}")
-                return url
-
-        print(f"  PAGE HLS: {urls[0]}")
-
-        return urls[0]
-
-    except Exception as e:
-        print(f"  PAGE ERROR: {e}")
-        return None
-
-
-def get_stream(video_id):
-    """
-    Сначала используем официальный play/options API.
-    Если HLS там отсутствует — пробуем страницу live/video.
-    """
-
-    url = get_api_hls(video_id)
-
-    if url:
-        return url
-
-    print("  API: HLS нет, проверяю страницу")
-
-    return get_page_hls(video_id)
-
-
-def get_channel_id(item):
-    return item.get("id") or item.get("object_id")
-
-
 def main():
-    print("Получаю Rutube autowidget...")
+    data = get_widget()
 
-    data = get_json(WIDGET_URL)
-
-    if not data:
-        print("Не удалось получить данные Rutube.")
-        raise SystemExit(1)
-
-    results = data.get("results", [])
-
-    if not isinstance(results, list):
-        print("В ответе отсутствует results.")
-        raise SystemExit(1)
-
-    # ---------------------------------------------------------
-    # Каналы берём ТОЛЬКО из "Все прямые эфиры"
-    # ---------------------------------------------------------
+    results = data.get("results") or []
 
     all_live = None
 
-    for item in results:
-        if item.get("name") == "Все прямые эфиры":
-            all_live = item
+    # Ищем именно "Все прямые эфиры".
+    for group in results:
+        if group.get("name") == "Все прямые эфиры":
+            all_live = group
             break
 
     if not all_live:
-        print('Не найдена группа "Все прямые эфиры".')
-        raise SystemExit(1)
+        raise RuntimeError('Не найден раздел "Все прямые эфиры"')
 
-    childs = all_live.get("childs", [])
-
-    channels = {}
-
-    for item in childs:
-        if not isinstance(item, dict):
-            continue
-
-        video_id = get_channel_id(item)
-
-        if not video_id:
-            continue
-
-        title = (
-            item.get("title")
-            or item.get("name")
-            or item.get("short_title")
-            or "Без названия"
-        )
-
-        channels[video_id] = {
-            "id": video_id,
-            "title": clean_title(title),
-        }
+    channels = all_live.get("childs") or []
 
     print(f'Всего каналов в "Все прямые эфиры": {len(channels)}')
+    print()
 
-    # ---------------------------------------------------------
-    # Группы берём из остальных результатов Rutube
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------
+    # Собираем группы каждого канала.
+    #
+    # Формат:
+    # channel_groups[video_id] = [
+    #     "Федеральные",
+    #     "Новости",
+    #     ...
+    # ]
+    # ------------------------------------------------------------
 
-    channel_groups = {
-        video_id: []
-        for video_id in channels
-    }
+    channel_groups = {}
 
     for group in results:
-        group_name = group.get("name")
+        group_name = (group.get("name") or "").strip()
 
         if not group_name:
             continue
@@ -281,118 +123,94 @@ def main():
         if group_name == "Все прямые эфиры":
             continue
 
-        group_childs = group.get("childs", [])
+        for channel in group.get("childs") or []:
+            video_id = channel.get("id")
 
-        if not isinstance(group_childs, list):
-            continue
-
-        for item in group_childs:
-            if not isinstance(item, dict):
+            if not video_id:
                 continue
 
-            video_id = get_channel_id(item)
-
-            if video_id not in channel_groups:
-                continue
+            channel_groups.setdefault(video_id, [])
 
             if group_name not in channel_groups[video_id]:
                 channel_groups[video_id].append(group_name)
 
-    # ---------------------------------------------------------
-    # Получаем HLS
-    # ---------------------------------------------------------
+    playlist = []
+    streams_found = 0
 
-    streams = {}
+    playlist.append("#EXTM3U")
+    playlist.append("")
 
-    total = len(channels)
+    for index, channel in enumerate(channels, 1):
 
-    for number, (video_id, channel) in enumerate(
-        channels.items(),
-        start=1
-    ):
-        print(
-            f"\n[{number}/{total}] {channel['title']}"
-        )
+        video_id = channel.get("id")
 
-        stream = get_stream(video_id)
-
-        if stream:
-            streams[video_id] = stream
-            print(f"  HLS: {stream}")
-        else:
-            print(
-                f"  STREAM: НЕТ  ID={video_id}"
-            )
-
-        time.sleep(0.1)
-
-    # ---------------------------------------------------------
-    # Формируем M3U
-    # ---------------------------------------------------------
-
-    lines = [
-        "#EXTM3U"
-    ]
-
-    records = 0
-
-    for video_id, channel in channels.items():
-
-        stream = streams.get(video_id)
-
-        if not stream:
+        if not video_id:
             continue
 
-        title = channel["title"]
-        groups = channel_groups.get(video_id, [])
-
-        if groups:
-            for group in groups:
-
-                lines.append(
-                    f'#EXTINF:-1 group-title="{group}",{title}'
-                )
-
-                lines.append(stream)
-
-                records += 1
-
-        else:
-            lines.append(
-                f"#EXTINF:-1,{title}"
-            )
-
-            lines.append(stream)
-
-            records += 1
-
-    # ---------------------------------------------------------
-    # Записываем
-    # ---------------------------------------------------------
-
-    with open(
-        OUTPUT,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        f.write(
-            "\n".join(lines) + "\n"
+        raw_title = (
+            channel.get("name")
+            or channel.get("title")
+            or "Без названия"
         )
 
-    print()
-    print("=" * 60)
-    print(f"Всего каналов: {total}")
-    print(f"Доступно HLS: {len(streams)}")
-    print(f"Записей M3U: {records}")
-    print(f"Файл: {OUTPUT}")
-    print("=" * 60)
+        title = clean_title(raw_title)
 
-    # Если вообще ничего не получили — считаем запуск ошибочным.
-    # Тогда GitHub Actions не будет затирать рабочий файл пустым M3U.
-    if not streams:
-        print("ОШИБКА: не найден ни один HLS-поток.")
-        raise SystemExit(1)
+        print(f"[{index}/{len(channels)}] {title}")
+
+        hls_url = get_hls(video_id)
+
+        if not hls_url:
+            print(f"  STREAM: НЕТ  ID={video_id}")
+            print()
+            continue
+
+        print(f"  HLS: {hls_url}")
+
+        groups = channel_groups.get(video_id, [])
+
+        # --------------------------------------------------------
+        # Как в версии для ПК:
+        # один и тот же канал добавляется отдельно для каждой
+        # группы RUTUBE.
+        # --------------------------------------------------------
+
+        if groups:
+            for group_name in groups:
+                playlist.append(
+                    f'#EXTINF:-1 group-title="{group_name}",{title}'
+                )
+                playlist.append(hls_url)
+                playlist.append("")
+
+        else:
+            # Если RUTUBE не присвоил каналу тематическую группу,
+            # всё равно сохраняем канал.
+            playlist.append(
+                f'#EXTINF:-1 group-title="Без группы",{title}'
+            )
+            playlist.append(hls_url)
+            playlist.append("")
+
+        streams_found += 1
+
+        # Небольшая пауза между запросами.
+        time.sleep(0.1)
+
+    if streams_found == 0:
+        raise RuntimeError(
+            "Не найдено ни одного HLS-потока. "
+            "rutube.m3u не изменён."
+        )
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(playlist))
+
+    print()
+    print(f"Готово.")
+    print(f"Каналов с HLS: {streams_found}")
+    print(f"Файл: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
     main()
+
